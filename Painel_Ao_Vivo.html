@@ -1,0 +1,154 @@
+
+        <!DOCTYPE html>
+        <html lang="pt-PT">
+        <head>
+            <meta charset="UTF-8">
+            <title>Live Tracking - Radar Automático (Cloud)</title>
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+            <style>
+                body, html { margin: 0; padding: 0; height: 100%; font-family: 'Segoe UI', sans-serif; background: #e9ecef; }
+                #map { width: 100%; height: 100%; }
+                .sidebar { position: absolute; top: 15px; left: 50px; z-index: 1000; width: 280px; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+                .info-p { margin: 5px 0; font-size: 13px; }
+                .camadas-box { background: #f1f2f6; padding: 10px; border-radius: 6px; margin: 10px 0; font-size: 12px; border: 1px solid #e1e4e8; }
+                
+                .lbl-vendedor { background-color: #002060 !important; border: 2px solid #ffffff !important; border-radius: 12px !important; padding: 3px 8px !important; font-weight: 900 !important; font-size: 12px !important; color: #ffffff !important; box-shadow: 0 3px 6px rgba(0,0,0,0.5) !important; margin-bottom: 25px !important; z-index: 9999 !important; }
+                .leaflet-tooltip.lbl-vendedor::before { border-top-color: #002060 !important; }
+                
+                .nav-arrow-container { width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; z-index: 1000; }
+                .nav-arrow { width: 0; height: 0; border-left: 10px solid transparent; border-right: 10px solid transparent; border-bottom: 20px solid #E74C3C; filter: drop-shadow(0px 2px 3px rgba(0,0,0,0.6)); transition: transform 0.5s ease-out; }
+                
+                .pulse-dot { width: 18px; height: 18px; background-color: #E74C3C; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); animation: pulse 1.5s infinite; z-index: 1000; }
+                @keyframes pulse { 0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); } 70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); } 100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); } }
+            </style>
+        </head>
+        <body>
+            <div class="sidebar">
+                <h3 style="margin-top: 0; font-size: 16px; border-bottom: 2px solid #eee; padding-bottom: 5px;">📡 Sala de Controlo (Radar)</h3>
+                <p style="font-size: 12px; color: #555;">Sincronizado com a nuvem a cada <b>5 segundos</b>.</p>
+                
+                <div class="camadas-box">
+                    <label style="cursor:pointer; display:flex; align-items:center;">
+                        <input type="checkbox" id="chk_trajeto" checked onchange="toggleTrajetos()" style="margin-right: 8px;"> 
+                        <b style="color:#8E44AD;">📍 Exibir Rota Percorrida</b>
+                    </label>
+                </div>
+
+                <div id="status_servidor" style="font-size: 11px; font-weight: bold; color: #E74C3C; margin-bottom: 10px;">A conectar à nuvem...</div>
+                <hr style="border: 0; border-top: 1px solid #ccc;">
+                <div style="font-size: 14px; font-weight: bold;">Dispositivos em Rota: <span id="num_online" style="color: #2CC985;">0</span></div>
+            </div>
+            <div id="map"></div>
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+            <script>
+                const API_BASE = "https://eduardo588326.pythonanywhere.com";
+                const googleStreets = L.tileLayer('http://mt0.google.com/vt/lyrs=m&hl=pt-BR&x={x}&y={y}&z={z}', {maxZoom: 20});
+                let map = L.map('map', { center: [-3.76, -49.67], zoom: 12, layers: [googleStreets] });
+                L.control.layers({"Mapa Ruas": googleStreets, "Satélite": L.tileLayer('http://mt0.google.com/vt/lyrs=s&hl=pt-BR&x={x}&y={y}&z={z}')}, null).addTo(map);
+                
+                let layerGroup = L.featureGroup().addTo(map);
+                let trajetoGroup = L.featureGroup().addTo(map);
+                
+                let marcadores = {};
+                let polylines = {};
+                let zoomInicialFeito = false;
+
+                function toggleTrajetos() {
+                    if(document.getElementById('chk_trajeto').checked) map.addLayer(trajetoGroup);
+                    else map.removeLayer(trajetoGroup);
+                }
+
+                function classificarAtividade(velKm, activityStr) {
+                    if (activityStr && activityStr !== 'None') return activityStr.toUpperCase();
+                    if (velKm > 35) return "Veículo (Rápido)";
+                    if (velKm > 8) return "Veículo (Lento)";
+                    if (velKm > 1.5) return "Caminhando";
+                    return "Parado";
+                }
+
+                async function buscarPosicoes() {
+                    try {
+                        let response = await fetch(`${API_BASE}/api/live`);
+                        if (!response.ok) throw new Error('Servidor não respondeu OK');
+                        let data = await response.json();
+                        
+                        document.getElementById('status_servidor').innerText = '🟢 Nuvem Sincronizada';
+                        document.getElementById('status_servidor').style.color = '#2CC985';
+                        document.getElementById('num_online').innerText = data.length;
+                        
+                        let pontosZoom = [];
+                        let hojeData = new Date();
+                        let hojeStr = hojeData.getFullYear() + '-' + String(hojeData.getMonth()+1).padStart(2,'0') + '-' + String(hojeData.getDate()).padStart(2,'0');
+
+                        data.forEach(d => {
+                            if(!d.latitude || !d.longitude) return;
+                            let lat = parseFloat(d.latitude);
+                            let lon = parseFloat(d.longitude);
+                            pontosZoom.push([lat, lon]);
+
+                            let speedNos = parseFloat(d.speed) || 0;
+                            let speedKmh = Math.round(speedNos * 1.852);
+                            let accuracyM = Math.round(parseFloat(d.accuracy) || 0);
+                            let bearingDeg = parseFloat(d.bearing) || 0;
+                            let strAtiv = classificarAtividade(speedKmh, d.activity);
+                            
+                            let isMoving = speedKmh > 2; 
+                            let iconHtml = isMoving 
+                                ? `<div class="nav-arrow-container"><div class="nav-arrow" style="transform: rotate(${bearingDeg}deg);"></div></div>`
+                                : `<div class="pulse-dot"></div>`;
+
+                            let popupHTML = `<div style="font-family: Arial; width: 160px;">
+                                <h4 style="margin:0 0 5px 0; border-bottom: 1px solid #ccc; color: #002060;">🏍️ ${d.vendedor_id}</h4>
+                                <p class="info-p" style="color: #666; font-size:11px;">⌚ ${d.ultimo_ping}</p>
+                                <p class="info-p"><b>Velocidade:</b> ${speedKmh} km/h</p>
+                                <p class="info-p"><b>Ação:</b> <span style="color:#2CC985;">${strAtiv}</span></p>
+                                <hr style="margin:5px 0; border-top:1px dotted #ccc;">
+                                <p class="info-p" style="font-size:11px;">🔋 Bat: ${d.bateria ? d.bateria + '%' : '?'} | 📡 Prec: ${accuracyM}m</p>
+                            </div>`;
+                            
+                            if(marcadores[d.vendedor_id]) {
+                                marcadores[d.vendedor_id].setLatLng([lat, lon]);
+                                marcadores[d.vendedor_id].setIcon(L.divIcon({ html: iconHtml, className: '' }));
+                                marcadores[d.vendedor_id].getPopup().setContent(popupHTML);
+                            } else {
+                                let mIcon = L.divIcon({ html: iconHtml, className: '' });
+                                let m = L.marker([lat, lon], {icon: mIcon}).bindPopup(popupHTML).addTo(layerGroup);
+                                m.bindTooltip(d.vendedor_id, {permanent: true, direction: 'top', className: 'lbl-vendedor', offset: [0, -20]});
+                                marcadores[d.vendedor_id] = m;
+                            }
+
+                            if(!polylines[d.vendedor_id]) {
+                                polylines[d.vendedor_id] = L.polyline([], {color: '#8E44AD', weight: 4, opacity: 0.8}).addTo(trajetoGroup);
+                                let url = `${API_BASE}/api/historico_pings?vendedor=${d.vendedor_id}&inicio=${hojeStr}&fim=${hojeStr}`;
+                                fetch(url).then(r => r.json()).then(historico => {
+                                    let pts = [];
+                                    if(Array.isArray(historico)) {
+                                        historico.forEach(p => pts.push([parseFloat(p.latitude), parseFloat(p.longitude)]));
+                                    }
+                                    polylines[d.vendedor_id].setLatLngs(pts);
+                                    polylines[d.vendedor_id].addLatLng([lat, lon]); 
+                                }).catch(e => console.log("Erro ao carregar trajeto:", e));
+                            } else {
+                                let pts = polylines[d.vendedor_id].getLatLngs();
+                                if(pts.length === 0 || pts[pts.length-1].lat !== lat || pts[pts.length-1].lng !== lon) {
+                                    polylines[d.vendedor_id].addLatLng([lat, lon]);
+                                }
+                            }
+                        });
+
+                        if(!zoomInicialFeito && pontosZoom.length > 0) {
+                            map.fitBounds(layerGroup.getBounds(), {padding: [50, 50], maxZoom: 16});
+                            zoomInicialFeito = true;
+                        }
+                    } catch(e) {
+                        document.getElementById('status_servidor').innerText = '🔴 Falha na conexão (Nuvem)';
+                        document.getElementById('status_servidor').style.color = '#E74C3C';
+                    }
+                }
+
+                buscarPosicoes();
+                setInterval(buscarPosicoes, 5000);
+            </script>
+        </body>
+        </html>
+        
